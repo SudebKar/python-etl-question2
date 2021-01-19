@@ -1,0 +1,18 @@
+#Source database configurations
+db.config :
+  driver : 'oracle+cx_oracle'  # mention dialect + driver here
+  host : 'localhost'
+  port : 8888
+  user : 'username'
+  password : 'password'
+  database : 'tst_orcl_db'
+
+#Input parameter setup
+extract.month :
+  list.of.months : #Enter the months for which Sales extract is needed
+    - 3
+    - 4
+
+
+#Mode of application usage parameter used for main program run
+mode : 'load' #Allowable values - pull, load

@@ -1,0 +1,4 @@
+sales_id,sales_amount,sales_date,region_id,customer_id
+11,2500.25,2020-03-01,6,6
+12,5500.25,2020-04-01,7,4
+14,9500.0,2020-04-01,8,5

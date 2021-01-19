@@ -1,0 +1,19 @@
+
+#Database configurations
+db.config :
+  driver : 'postgres'
+  host : 'localhost'
+  username : 'postgres'
+  password : 'postgres'
+  port : 5432
+  database : 'ports_testing'
+
+
+#Input parameter setup
+extract.month :
+  list.of.months : #Enter the months for which Sales extract is needed
+    - 3
+    - 4
+
+#Mode of application usage parameter used for main program run
+mode : 'load' #Allowable values - pull, load

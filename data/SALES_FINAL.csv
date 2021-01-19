@@ -1,0 +1,4 @@
+sales_date,sales_amount,customer_name,customer_address,customer_phone,region_name,country
+2020-03-01,2500.25,cust3,hjtgh4,12432135,east,india
+2020-04-01,5500.25,cust1,abc123,1243,west,india
+2020-04-01,9500.0,cust2,asdf34,112353,south,india

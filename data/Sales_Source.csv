@@ -1,0 +1,5 @@
+sales_date,sales_amount,customer_name,customer_address,customer_phone,region_name,country
+2020-03-01,2500.25,Akshar,Hitech City,12432135,Central  ,India
+2020-04-01,5500.25,Risabh,Gurgaon,1243234,North,India
+2020-04-01,9500.0,Sundar,Mysore Rural,145612353,South,India
+2020-05-12,1233.4,Sharma,Bandra,46451243,West,India
