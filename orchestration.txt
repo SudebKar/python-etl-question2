@@ -1,0 +1,127 @@
+Orchestration (Scheduler) Repo – Code Structure
+orchestration-scheduler/
+│
+├─ src/
+│   ├─ config/
+│   │   ├─ scheduler.yaml          # polling intervals, thread counts
+│   │   ├─ db.yaml                 # DB connection (non-secret)
+│   │   └─ app.yaml                # service-level config
+│   │
+│   ├─ core/
+│   │   ├─ __init__.py
+│   │   ├─ scheduler.py            # APScheduler bootstrap & lifecycle
+│   │   ├─ registry.py             # DB → APScheduler job registration
+│   │   ├─ http_client.py          # Calls FastAPI run-process-async
+│   │   └─ locks.py                # DB-based locking / leader election
+│   │
+│   ├─ jobs/
+│   │   ├─ __init__.py
+│   │   ├─ time_based.py           # cron-based triggers
+│   │   └─ event_based.py          # dependency-driven triggers
+│   │
+│   ├─ models/
+│   │   ├─ __init__.py
+│   │   ├─ schedule_metadata.py    # ORM for schedule config tables
+│   │   ├─ run_state.py             # ORM for run status tracking
+│   │   └─ dependency.py            # ORM for process dependencies
+│   │
+│   ├─ repository/
+│   │   ├─ __init__.py
+│   │   ├─ schedule_repo.py         # DB access for schedules
+│   │   ├─ run_state_repo.py        # DB access for run status
+│   │   └─ dependency_repo.py       # DB access for dependencies
+│   │
+│   ├─ services/
+│   │   ├─ __init__.py
+│   │   ├─ trigger_service.py       # orchestration logic
+│   │   └─ evaluation_service.py    # completion / failure evaluation
+│   │
+│   ├─ exceptions.py
+│   └─ main.py                      # Scheduler entrypoint
+│
+├─ tests/
+│   ├─ test_scheduler.py
+│   ├─ test_event_trigger.py
+│   └─ test_time_trigger.py
+│
+├─ Dockerfile
+├─ requirements.txt
+└─ README.md
+
+Why this structure works (and won’t collapse later)
+1️⃣ core/ – Infrastructure, not business logic
+
+This is where APScheduler lives.
+
+scheduler.py
+→ start / stop APScheduler, graceful shutdown
+
+registry.py
+→ reads DB schedule metadata and registers jobs
+
+locks.py
+→ ensures only one scheduler instance fires jobs in OCP
+
+This avoids duplicate triggers when pods scale.
+
+2️⃣ jobs/ – Trigger logic only
+
+These are thin wrappers.
+
+time_based.py
+
+Cron → call trigger_service
+
+event_based.py
+
+Poll run_state table
+
+Detect completion
+
+Fire dependent process
+
+No ETL logic. No metadata interpretation.
+
+3️⃣ models/ – DB is the source of truth
+
+These mirror tables like:
+
+schedule configuration
+
+process run state
+
+dependencies
+
+This is what replaces Autosys job definitions.
+
+4️⃣ services/ – The brain
+
+This is where orchestration decisions happen:
+
+Should this job fire now?
+
+Has it already fired?
+
+Was it retried?
+
+Was dependency satisfied?
+
+This keeps jobs/ dumb and testable.
+
+5️⃣ repository/ – Isolation from DB tech
+
+Tomorrow:
+
+SQL Server → Postgres
+
+On-prem → cloud
+
+Your scheduler logic doesn’t care.
+
+6️⃣ main.py – One responsibility
+Start scheduler
+Load schedules
+Run forever
+
+
+No HTTP server. No UI. No FastAPI.
