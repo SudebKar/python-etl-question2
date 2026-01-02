@@ -1,61 +1,172 @@
-Step 4: Repository layer (clean and boring — that’s good)
-4.1 Schedule repository
-# src/repositories/schedule_repository.py
-from sqlmodel import select
-from src.db.session import get_session
-from src.models.scheduler_process_schedule import SchedulerProcessSchedule
+ProcessTriggerService
 
-class ScheduleRepository:
+Purpose:
+Trigger a data pipeline via FastAPI and persist run state.
+
+This is the single entry point for starting any process — scheduled, adhoc, or event-driven.
+
+Key behaviors
+
+Calls run-process-async
+
+Persists STARTED state
+
+Returns run_id
+
+process_trigger_service.py
+import requests
+from datetime import datetime
+from src.models.scheduler_run_state import SchedulerRunState
+from src.repositories.run_state_repository import RunStateRepository
+from src.config.settings import settings
+
+
+class ProcessTriggerService:
 
     @staticmethod
-    def get_active_schedules():
-        with get_session() as session:
-            stmt = select(SchedulerProcessSchedule).where(
-                SchedulerProcessSchedule.active_flag == True
-            )
-            return session.exec(stmt).all()
+    def trigger_process(process_id: str, run_type: str) -> str:
+        """
+        Triggers FastAPI async process and records run state.
+        """
 
-4.2 Run state repository
-# src/repositories/run_state_repository.py
+        payload = {
+            "process_name": process_id,
+            "run_type": run_type
+        }
+
+        response = requests.post(
+            f"{settings.fastapi_base_url}/run-process-async",
+            json=payload,
+            timeout=10
+        )
+
+        response.raise_for_status()
+
+        run_id = response.json()["run_id"]
+
+        run_state = SchedulerRunState(
+            run_id=run_id,
+            process_id=process_id,
+            run_type=run_type,
+            start_time=datetime.utcnow(),
+            status="STARTED"
+        )
+
+        RunStateRepository.create_run(run_state)
+
+        return run_id
+
+
+Why this is correct
+
+Scheduler owns state
+
+FastAPI owns execution
+
+Loose coupling via HTTP
+
+2️⃣ ProcessStatusService
+
+Purpose:
+Poll FastAPI for execution status and update scheduler DB.
+
+This is what enables:
+
+dependency resolution
+
+retries
+
+recovery after pod restarts
+
+process_status_service.py
+import requests
+from src.repositories.run_state_repository import RunStateRepository
+from src.config.settings import settings
+
+
+class ProcessStatusService:
+
+    @staticmethod
+    def refresh_run_status(run_id: str) -> str:
+        """
+        Polls FastAPI for run status and updates DB.
+        """
+
+        response = requests.get(
+            f"{settings.fastapi_base_url}/get-process-status",
+            params={"run_id": run_id},
+            timeout=10
+        )
+
+        response.raise_for_status()
+
+        status = response.json()["status"]
+        error = response.json().get("error_description")
+
+        RunStateRepository.update_status(
+            run_id=run_id,
+            status=status,
+            error=error
+        )
+
+        return status
+
+
+Important design note (non-negotiable):
+
+Scheduler polls
+
+Execution service never calls back
+
+This avoids tight coupling and security nightmares
+
+3️⃣ DependencyResolverService
+
+Purpose:
+Decide whether a process can run now based on upstream completion.
+
+This service does no triggering — only decision-making.
+
+dependency_resolver_service.py
 from sqlmodel import select
-from datetime import datetime
 from src.db.session import get_session
+from src.repositories.dependency_repository import DependencyRepository
 from src.models.scheduler_run_state import SchedulerRunState
 
-class RunStateRepository:
+
+class DependencyResolverService:
 
     @staticmethod
-    def create_run(run: SchedulerRunState):
+    def can_run(process_id: str) -> bool:
+        """
+        Returns True if all parent dependencies are satisfied.
+        """
+
+        dependencies = DependencyRepository.get_dependencies(process_id)
+
+        if not dependencies:
+            return True  # no dependencies, safe to run
+
         with get_session() as session:
-            session.add(run)
-            session.commit()
+            for dep in dependencies:
+                stmt = (
+                    select(SchedulerRunState)
+                    .where(SchedulerRunState.process_id == dep.parent_process_id)
+                    .order_by(SchedulerRunState.start_time.desc())
+                )
 
-    @staticmethod
-    def update_status(run_id: str, status: str, error: str = None):
-        with get_session() as session:
-            run = session.get(SchedulerRunState, run_id)
-            if not run:
-                return
-            run.status = status
-            if status in ("COMPLETED", "FAILED"):
-                run.end_time = datetime.utcnow()
-            if error:
-                run.error_description = error
-            session.add(run)
-            session.commit()
+                last_run = session.exec(stmt).first()
 
-4.3 Dependency repository
-# src/repositories/dependency_repository.py
-from sqlmodel import select
-from src.db.session import get_session
-from src.models.scheduler_process_dependency import SchedulerProcessDependency
+                if not last_run or last_run.status != "COMPLETED":
+                    return False
 
-class DependencyRepository:
+        return True
 
-    @staticmethod
-    def get_dependencies(process_id: str):
-        with get_session() as session:
-            stmt = select(SchedulerProcessDependency).where(
-                SchedulerProcessDependency.process_id == process_id
-            )
-            return session.exec(stmt).all()
+
+Straight talk:
+
+Dependency is evaluated on latest run
+
+This matches how Autosys / Control-M actually behave
+
+Overengineering historical graphs here is a trap
