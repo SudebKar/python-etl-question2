@@ -1,84 +1,116 @@
-scheduled_process_job.py
-from src.services.process_trigger_service import ProcessTriggerService
-from src.services.dependency_resolver_service import DependencyResolverService
-
-
-class ScheduledProcessJob:
-
-    @staticmethod
-    def execute(process_id: str):
-        """
-        Entry point for scheduled job execution.
-        """
-
-        can_run = DependencyResolverService.can_run(process_id)
-
-        if not can_run:
-            # Dependency not met — do nothing, scheduler will retry later
-            return
-
-        ProcessTriggerService.trigger_process(
-            process_id=process_id,
-            run_type="scheduled"
-        )
-
-
-Why this is correct
-
-Scheduler retries naturally
-
-No sleep / wait / polling
-
-Dependency logic is centralized
-
-This mimics Autosys “box job” behavior.
-
-2️⃣ StatusMonitorJob
+1️⃣ job_registry.py
 
 Purpose:
-Track running jobs and update their state.
+Translate DB schedules → APScheduler jobs.
 
-This job:
+This keeps scheduler.py dumb.
 
-scans STARTED runs
-
-polls FastAPI
-
-updates DB
-
-enables downstream dependencies
-
-status_monitor_job.py
-from sqlmodel import select
-from src.db.session import get_session
-from src.models.scheduler_run_state import SchedulerRunState
-from src.services.process_status_service import ProcessStatusService
+job_registry.py
+from apscheduler.triggers.cron import CronTrigger
+from src.repositories.schedule_repository import ScheduleRepository
+from src.jobs.scheduled_process_job import ScheduledProcessJob
 
 
-class StatusMonitorJob:
+class JobRegistry:
 
     @staticmethod
-    def execute():
+    def register_jobs(scheduler):
         """
-        Polls all running processes and refreshes their status.
+        Reads schedules from DB and registers them with APScheduler.
         """
 
-        with get_session() as session:
-            stmt = select(SchedulerRunState).where(
-                SchedulerRunState.status == "STARTED"
+        schedules = ScheduleRepository.get_active_schedules()
+
+        for sched in schedules:
+            if sched.schedule_type != "CRON":
+                continue  # event-based comes later
+
+            trigger = CronTrigger.from_crontab(sched.cron_expression)
+
+            scheduler.add_job(
+                func=ScheduledProcessJob.execute,
+                trigger=trigger,
+                args=[sched.process_id],
+                id=str(sched.job_id),
+                replace_existing=True,
+                max_instances=1,
+                misfire_grace_time=300
             )
 
-            running_jobs = session.exec(stmt).all()
+Why this design is solid
 
-        for job in running_jobs:
-            try:
-                ProcessStatusService.refresh_run_status(job.run_id)
-            except Exception:
-                # Intentionally swallow exceptions
-                # Next run will retry
-                continue
+DB is the source of truth
+
+Scheduler restart = clean rehydration
+
+No hardcoded schedules
+
+Ops can enable/disable via DB
+
+2️⃣ scheduler.py
+
+Purpose:
+Bootstrap APScheduler and start background jobs.
+
+This file should be boringly short.
+
+scheduler.py
+from apscheduler.schedulers.background import BackgroundScheduler
+from src.core.job_registry import JobRegistry
+from src.jobs.status_monitor_job import StatusMonitorJob
 
 
-Blunt truth:
-Schedulers must be forgiving, not fragile.
-Crashing here would be a design failure.
+def start_scheduler():
+    scheduler = BackgroundScheduler(
+        job_defaults={
+            "coalesce": True,
+            "max_instances": 1
+        }
+    )
+
+    # Register scheduled pipeline jobs
+    JobRegistry.register_jobs(scheduler)
+
+    # Register status monitor (every 1 minute)
+    scheduler.add_job(
+        func=StatusMonitorJob.execute,
+        trigger="interval",
+        minutes=1,
+        id="status_monitor",
+        replace_existing=True
+    )
+
+    scheduler.start()
+
+    return scheduler
+
+How this plugs into runtime (important)
+
+You will call start_scheduler() from exactly one place:
+
+Either:
+
+a standalone main.py for scheduler service
+
+Or:
+
+if __name__ == "__main__":
+
+⚠️ Do NOT start APScheduler inside FastAPI lifecycle hooks.
+That’s how people accidentally start N schedulers per pod.
+
+Current architecture state (checkpoint)
+
+You now have:
+
+Stateless FastAPI execution service
+
+Durable scheduler metadata
+
+APScheduler as a thin trigger engine
+
+Clean separation of concerns
+
+Restart-safe scheduling
+
+This is already better than many Airflow deployments.
