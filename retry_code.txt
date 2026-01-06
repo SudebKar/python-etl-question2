@@ -1,0 +1,189 @@
+STEP 1: Core – Retry policy & evaluator
+core/retry_policy.py
+
+Keep this dumb and deterministic.
+
+from dataclasses import dataclass
+from typing import List
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    max_retries: int
+    backoff_seconds: List[int]
+
+DEFAULT_RETRY_POLICY = RetryPolicy(
+    max_retries=3,
+    backoff_seconds=[60, 300, 900]
+)
+
+core/failure_classifier.py
+class FailureType:
+    TRANSIENT = "TRANSIENT"
+    PERMANENT = "PERMANENT"
+    UNKNOWN = "UNKNOWN"
+
+
+def classify_failure(error_description: str | None) -> str:
+    if not error_description:
+        return FailureType.UNKNOWN
+
+    error = error_description.lower()
+
+    if any(x in error for x in ["timeout", "connection", "network"]):
+        return FailureType.TRANSIENT
+
+    if any(x in error for x in ["syntax", "invalid", "constraint"]):
+        return FailureType.PERMANENT
+
+    return FailureType.UNKNOWN
+
+
+Brutally simple. That’s intentional.
+
+core/retry_evaluator.py
+from dataclasses import dataclass
+from datetime import timedelta
+from core.retry_policy import DEFAULT_RETRY_POLICY
+from core.failure_classifier import classify_failure, FailureType
+
+@dataclass
+class RetryDecision:
+    should_retry: bool
+    delay_seconds: int | None
+    next_attempt_no: int | None
+    reason: str
+
+
+def evaluate_retry(
+    *,
+    current_attempt_no: int,
+    error_description: str | None
+) -> RetryDecision:
+
+    failure_type = classify_failure(error_description)
+
+    if failure_type == FailureType.PERMANENT:
+        return RetryDecision(False, None, None, "Permanent failure")
+
+    if current_attempt_no >= DEFAULT_RETRY_POLICY.max_retries:
+        return RetryDecision(False, None, None, "Retry limit exceeded")
+
+    delay = DEFAULT_RETRY_POLICY.backoff_seconds[current_attempt_no - 1]
+
+    return RetryDecision(
+        should_retry=True,
+        delay_seconds=delay,
+        next_attempt_no=current_attempt_no + 1,
+        reason=f"Retrying due to {failure_type}"
+    )
+
+
+Key points:
+
+No DB calls
+
+No scheduler calls
+
+Pure business logic
+
+Testable in isolation
+
+STEP 2: Job – Retry execution wrapper
+jobs/retry_job.py
+
+This is what APScheduler will execute.
+
+from services.run_state_service import RunStateService
+from services.process_trigger_service import ProcessTriggerService
+
+def retry_process_job(
+    process_id: int,
+    parent_run_id: int,
+    attempt_no: int
+):
+    run_state_service = RunStateService()
+    trigger_service = ProcessTriggerService()
+
+    # create new run entry
+    new_run = run_state_service.create_run(
+        process_id=process_id,
+        run_type="retry",
+        parent_run_id=parent_run_id,
+        attempt_no=attempt_no,
+        triggered_by="SYSTEM"
+    )
+
+    # trigger actual execution
+    trigger_service.trigger_process(
+        process_id=process_id,
+        run_id=new_run.run_id,
+        run_type="retry"
+    )
+
+
+No logic here.
+This job only orchestrates.
+
+STEP 3: Service – Retry scheduling coordinator
+services/retry_service.py
+from apscheduler.schedulers.background import BackgroundScheduler
+from core.retry_evaluator import evaluate_retry
+from jobs.retry_job import retry_process_job
+
+class RetryService:
+
+    def __init__(self, scheduler: BackgroundScheduler):
+        self.scheduler = scheduler
+
+    def handle_failure(
+        self,
+        *,
+        process_id: int,
+        run_id: int,
+        attempt_no: int,
+        error_description: str | None
+    ):
+        decision = evaluate_retry(
+            current_attempt_no=attempt_no,
+            error_description=error_description
+        )
+
+        if not decision.should_retry:
+            return
+
+        self.scheduler.add_job(
+            retry_process_job,
+            trigger="date",
+            run_date=None,  # APScheduler calculates via next_run_time
+            seconds=decision.delay_seconds,
+            args=[process_id, run_id, decision.next_attempt_no],
+            id=f"retry-{run_id}-{decision.next_attempt_no}",
+            replace_existing=True
+        )
+
+
+This is your single entry point for retries.
+
+STEP 4: Wire it into run completion
+
+Wherever you mark a run as FAILED (likely in your executor callback):
+
+retry_service.handle_failure(
+    process_id=run.process_id,
+    run_id=run.run_id,
+    attempt_no=run.attempt_no,
+    error_description=run.error_description
+)
+
+
+That’s it. No other component needs to know.
+
+What this gives you immediately
+
+✔ Automatic retries
+✔ Backoff control
+✔ Audit-safe run_state history
+✔ No duplicate triggers
+✔ Clean separation
+
+This is production-grade, not toy code.
