@@ -1,0 +1,161 @@
+STEP 1 — Introduce event-driven metadata (DB + models)
+
+We do NOT touch:
+
+existing cron logic
+
+services
+
+scheduler bootstrap
+
+We only add capability.
+
+1️⃣ Database table (event queue)
+
+This table is the contract between external systems and your scheduler.
+
+CREATE TABLE scheduler_event_queue (
+    event_id        UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    event_type      VARCHAR(50) NOT NULL,
+    reference_key   VARCHAR(100) NOT NULL,
+    payload         NVARCHAR(MAX),
+    processed_flag  BIT DEFAULT 0,
+    created_time    DATETIME DEFAULT GETUTCDATE(),
+    processed_time  DATETIME
+);
+
+
+Key points (important):
+
+External systems only INSERT
+
+Scheduler only READS + UPDATES
+
+Fully auditable
+
+Replay-friendly
+
+2️⃣ Event → process mapping table
+
+This avoids hardcoding logic.
+
+CREATE TABLE scheduler_event_mapping (
+    event_type      VARCHAR(50) NOT NULL,
+    reference_key   VARCHAR(100) NOT NULL,
+    process_id      VARCHAR(100) NOT NULL,
+    active_flag     BIT DEFAULT 1,
+    PRIMARY KEY (event_type, reference_key)
+);
+
+
+Example mapping:
+
+(EXTERNAL_PROCESS_COMPLETED, UPSTREAM_GL_POSTING) → LEDGER_AGG_PROCESS
+
+
+This is what makes the system config-driven.
+
+3️⃣ SQLModel models
+models/scheduler_event_queue.py
+from sqlmodel import SQLModel, Field
+from typing import Optional
+from datetime import datetime
+import uuid
+
+class SchedulerEventQueue(SQLModel, table=True):
+    __tablename__ = "scheduler_event_queue"
+
+    event_id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    event_type: str
+    reference_key: str
+    payload: Optional[str] = None
+    processed_flag: bool = Field(default=False)
+    created_time: datetime = Field(default_factory=datetime.utcnow)
+    processed_time: Optional[datetime] = None
+
+models/scheduler_event_mapping.py
+from sqlmodel import SQLModel, Field
+
+class SchedulerEventMapping(SQLModel, table=True):
+    __tablename__ = "scheduler_event_mapping"
+
+    event_type: str = Field(primary_key=True)
+    reference_key: str = Field(primary_key=True)
+    process_id: str
+    active_flag: bool = Field(default=True)
+
+4️⃣ Repository layer (minimal)
+repositories/event_repository.py
+from sqlmodel import select
+from datetime import datetime
+from src.db.session import get_session
+from src.models.scheduler_event_queue import SchedulerEventQueue
+
+class EventRepository:
+
+    @staticmethod
+    def get_unprocessed_events(limit: int = 10):
+        with get_session() as session:
+            stmt = (
+                select(SchedulerEventQueue)
+                .where(SchedulerEventQueue.processed_flag == False)
+                .order_by(SchedulerEventQueue.created_time)
+                .limit(limit)
+            )
+            return session.exec(stmt).all()
+
+    @staticmethod
+    def mark_processed(event_id):
+        with get_session() as session:
+            event = session.get(SchedulerEventQueue, event_id)
+            if not event:
+                return
+            event.processed_flag = True
+            event.processed_time = datetime.utcnow()
+            session.add(event)
+            session.commit()
+
+repositories/event_mapping_repository.py
+from sqlmodel import select
+from src.db.session import get_session
+from src.models.scheduler_event_mapping import SchedulerEventMapping
+
+class EventMappingRepository:
+
+    @staticmethod
+    def get_process_for_event(event_type: str, reference_key: str):
+        with get_session() as session:
+            stmt = select(SchedulerEventMapping).where(
+                SchedulerEventMapping.event_type == event_type,
+                SchedulerEventMapping.reference_key == reference_key,
+                SchedulerEventMapping.active_flag == True
+            )
+            return session.exec(stmt).first()
+
+What we achieved in Step 1
+
+You now have:
+
+A durable event ingestion contract
+
+Zero coupling to external systems
+
+Replay capability
+
+No scheduler logic touched yet
+
+This step is low risk and deployable independently.
+
+STEP 2 (next logical step)
+
+Next we will add:
+
+EventMonitorJob (polling + triggering)
+
+Reuse existing:
+
+DependencyResolverService
+
+ProcessTriggerService
+
+This is where event-driven execution actually happens.
