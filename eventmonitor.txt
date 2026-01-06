@@ -1,0 +1,149 @@
+STEP 2 — EventMonitorJob (execution layer)
+What this job does (precisely)
+
+On every run, it will:
+
+Fetch unprocessed external events
+
+Resolve event → process mapping
+
+Check dependency readiness
+
+Trigger the process via existing service
+
+Mark the event as processed only after trigger succeeds
+
+No cron logic is touched. No FastAPI changes.
+
+Placement in codebase
+src/
+└── jobs/
+    ├── scheduled_process_job.py
+    ├── status_monitor_job.py
+    └── event_monitor_job.py   <-- NEW
+
+EventMonitorJob – implementation
+src/jobs/event_monitor_job.py
+from src.repositories.event_repository import EventRepository
+from src.repositories.event_mapping_repository import EventMappingRepository
+from src.services.dependency_resolver_service import DependencyResolverService
+from src.services.process_trigger_service import ProcessTriggerService
+
+
+class EventMonitorJob:
+
+    @staticmethod
+    def execute(batch_size: int = 10):
+        """
+        Polls external events and triggers dependent processes.
+        """
+
+        events = EventRepository.get_unprocessed_events(limit=batch_size)
+
+        if not events:
+            return
+
+        for event in events:
+            try:
+                mapping = EventMappingRepository.get_process_for_event(
+                    event_type=event.event_type,
+                    reference_key=event.reference_key
+                )
+
+                if not mapping:
+                    # No mapping exists — skip safely
+                    continue
+
+                process_id = mapping.process_id
+
+                # Dependency check (same logic as cron jobs)
+                if not DependencyResolverService.can_run(process_id):
+                    continue
+
+                # Trigger process
+                ProcessTriggerService.trigger_process(
+                    process_id=process_id,
+                    run_type="event"
+                )
+
+                # Mark event as processed ONLY after successful trigger
+                EventRepository.mark_processed(event.event_id)
+
+            except Exception:
+                # Intentionally do nothing.
+                # Event will be retried on next scheduler run.
+                continue
+
+Design decisions (important, no sugar-coating)
+✔ Why this is correct
+
+At-least-once semantics
+
+Idempotency is enforced by:
+
+dependency checks
+
+downstream run-state logic
+
+Scheduler crashes won’t lose events
+
+External systems remain decoupled
+
+❌ What we deliberately avoided
+
+No long-running waits
+
+No blocking on downstream completion
+
+No status polling here
+
+No special-case logic for events
+
+That’s how you keep this maintainable.
+
+How this fits with your existing scheduler
+
+You already have:
+
+ScheduledProcessJob → cron-based
+
+StatusMonitorJob → state refresh
+
+You will add this later in core:
+
+scheduler.add_job(
+    EventMonitorJob.execute,
+    trigger="interval",
+    seconds=30,
+    id="event_monitor",
+    replace_existing=True
+)
+
+
+We are not doing that yet — this is just the job.
+
+What you should test locally (quick sanity)
+
+Insert mapping:
+
+INSERT INTO scheduler_event_mapping
+(event_type, reference_key, process_id)
+VALUES ('EXTERNAL_PROCESS_COMPLETED', 'UPSTREAM_JOB_X', 'PROCESS_Y');
+
+
+Insert event:
+
+INSERT INTO scheduler_event_queue
+(event_type, reference_key)
+VALUES ('EXTERNAL_PROCESS_COMPLETED', 'UPSTREAM_JOB_X');
+
+
+Run EventMonitorJob.execute() manually in REPL
+
+Verify:
+
+scheduler_run_state has a new row
+
+event marked processed
+
+FastAPI endpoint triggered
