@@ -1,0 +1,200 @@
+Step 0 – Set expectations (important)
+
+Retry and rerun are not the same thing:
+
+Concept	Triggered by	Uses same run_id?	Purpose
+Retry	System	❌ New run_id	Recover from transient failure
+Rerun	Human / API	❌ New run_id	Re-execute logic intentionally
+
+Both:
+
+Reference a previous run
+
+Create new run_state entries
+
+Must be auditable
+
+Step 1 – Minimal schema extensions (no redesign)
+
+You already have scheduler_run_state.
+Extend it slightly, do NOT add new tables yet.
+
+Add columns
+parent_run_id        BIGINT NULL
+attempt_no           INT DEFAULT 1
+triggered_by         VARCHAR(30)  -- SYSTEM / USER / EVENT
+
+
+Why:
+
+Retry = same parent_run_id, attempt_no + 1
+
+Rerun = same parent_run_id, attempt_no reset to 1
+
+No existing logic breaks.
+
+Step 2 – Define retry policy (keep it boring)
+
+Create a static retry policy first.
+
+Example (config-driven)
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = [60, 300, 900]
+
+
+Do not over-engineer:
+
+No exponential + jitter yet
+
+No per-process override yet
+
+Enterprise systems evolve this later.
+
+Step 3 – Failure classification (critical)
+
+Not all failures should retry.
+
+Add failure_type (enum or constant mapping):
+
+TRANSIENT
+PERMANENT
+UNKNOWN
+
+
+Rule of thumb:
+
+Network / timeout → TRANSIENT
+
+SQL syntax / validation → PERMANENT
+
+Everything else → UNKNOWN (retry once)
+
+This logic lives in core, not jobs.
+
+Step 4 – Retry flow (system-driven)
+Trigger point
+
+When:
+
+scheduler_run_state.status == FAILED
+
+Flow
+Run completed → FAILED
+   ↓
+RetryEvaluator
+   ↓
+Is retry allowed?
+   ↓
+Create new run_state
+   ↓
+Trigger execution
+
+Key rule
+
+❗ Retry never overwrites an existing run.
+
+Step 5 – RetryEvaluator (core logic)
+
+Responsibilities:
+
+Check failure type
+
+Check retry count
+
+Calculate delay
+
+Decide YES / NO
+
+Output:
+
+RetryDecision(
+    should_retry: bool,
+    delay_seconds: int,
+    attempt_no: int
+)
+
+
+No side effects here.
+
+Step 6 – Scheduling retry (how APScheduler fits)
+
+If retry allowed:
+
+Add one-time APScheduler job
+
+Trigger after delay
+
+Example conceptually:
+
+scheduler.add_job(
+    retry_job,
+    trigger="date",
+    run_date=now + delay,
+    args=[process_id, parent_run_id, attempt_no]
+)
+
+
+No cron involved.
+
+Step 7 – Retry job implementation (jobs package)
+
+Retry job does:
+
+Create new run_state
+
+Link parent_run_id
+
+Increment attempt_no
+
+Trigger execution
+
+If it fails again → loop via Step 4.
+
+Step 8 – Rerun logic (user/API-driven)
+
+Rerun is simpler.
+
+API endpoint
+POST /rerun/{run_id}
+
+What happens
+
+Fetch original run
+
+Create new run_state
+
+parent_run_id = original run_id
+
+attempt_no = 1
+
+triggered_by = USER
+
+Trigger execution
+
+No retry policy involved.
+
+Step 9 – Dependency handling (important nuance)
+
+Rules:
+
+Retry → does NOT re-trigger parent dependencies
+
+Rerun → depends on business rule:
+
+Default: re-run only this process
+
+Optional future enhancement: cascade rerun
+
+For now:
+👉 Keep rerun isolated.
+
+Step 10 – Observability hooks (lightweight for now)
+
+At minimum:
+
+Log retry decisions
+
+Log attempt_no
+
+Log parent_run_id
+
