@@ -1,116 +1,128 @@
-1️⃣ job_registry.py
+Leader election design (simple & safe)
+Core idea
 
-Purpose:
-Translate DB schedules → APScheduler jobs.
+One row = one active leader
 
-This keeps scheduler.py dumb.
+Leader must renew heartbeat
 
-job_registry.py
-from apscheduler.triggers.cron import CronTrigger
-from src.repositories.schedule_repository import ScheduleRepository
-from src.jobs.scheduled_process_job import ScheduledProcessJob
+If heartbeat expires → another pod can take over
+
+Step 1️⃣ Create leader lock table
+CREATE TABLE scheduler_leader_lock (
+    lock_name        VARCHAR(50) PRIMARY KEY,
+    owner_id         VARCHAR(100),
+    last_heartbeat   DATETIME
+);
 
 
-class JobRegistry:
+You will only ever have one row:
+
+lock_name = 'SCHEDULER_LEADER'
+
+Step 2️⃣ LeaderElectionService (core logic)
+
+📁 src/core/leader_election.py
+
+import socket
+from datetime import datetime, timedelta
+from sqlmodel import text
+from src.db.session import get_session
+
+
+class LeaderElectionService:
+
+    LOCK_NAME = "SCHEDULER_LEADER"
+    HEARTBEAT_TIMEOUT_SEC = 60
 
     @staticmethod
-    def register_jobs(scheduler):
+    def _owner_id():
+        return socket.gethostname()
+
+    @classmethod
+    def try_acquire_or_renew(cls) -> bool:
         """
-        Reads schedules from DB and registers them with APScheduler.
+        Returns True if this pod is leader.
         """
 
-        schedules = ScheduleRepository.get_active_schedules()
+        now = datetime.utcnow()
+        expiry = now - timedelta(seconds=cls.HEARTBEAT_TIMEOUT_SEC)
 
-        for sched in schedules:
-            if sched.schedule_type != "CRON":
-                continue  # event-based comes later
+        with get_session() as session:
+            session.exec(text("""
+                MERGE scheduler_leader_lock AS target
+                USING (SELECT :lock_name AS lock_name) AS source
+                ON target.lock_name = source.lock_name
+                WHEN MATCHED AND (
+                    target.last_heartbeat < :expiry
+                    OR target.owner_id = :owner_id
+                )
+                THEN UPDATE SET
+                    owner_id = :owner_id,
+                    last_heartbeat = :now
+                WHEN NOT MATCHED
+                THEN INSERT (lock_name, owner_id, last_heartbeat)
+                VALUES (:lock_name, :owner_id, :now);
+            """), {
+                "lock_name": cls.LOCK_NAME,
+                "owner_id": cls._owner_id(),
+                "now": now,
+                "expiry": expiry
+            })
 
-            trigger = CronTrigger.from_crontab(sched.cron_expression)
+            session.commit()
 
-            scheduler.add_job(
-                func=ScheduledProcessJob.execute,
-                trigger=trigger,
-                args=[sched.process_id],
-                id=str(sched.job_id),
-                replace_existing=True,
-                max_instances=1,
-                misfire_grace_time=300
-            )
+            result = session.exec(text("""
+                SELECT owner_id
+                FROM scheduler_leader_lock
+                WHERE lock_name = :lock_name
+            """), {"lock_name": cls.LOCK_NAME}).first()
 
-Why this design is solid
+            return result and result[0] == cls._owner_id()
 
-DB is the source of truth
 
-Scheduler restart = clean rehydration
+This:
 
-No hardcoded schedules
+is atomic
 
-Ops can enable/disable via DB
+is race-safe
 
-2️⃣ scheduler.py
+works across regions
 
-Purpose:
-Bootstrap APScheduler and start background jobs.
+survives crashes
 
-This file should be boringly short.
+Step 3️⃣ Modify scheduler bootstrap to respect leadership
 
-scheduler.py
+📁 src/core/scheduler.py
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from src.core.job_registry import JobRegistry
 from src.jobs.status_monitor_job import StatusMonitorJob
+from src.core.leader_election import LeaderElectionService
+import time
 
 
 def start_scheduler():
-    scheduler = BackgroundScheduler(
-        job_defaults={
-            "coalesce": True,
-            "max_instances": 1
-        }
-    )
-
-    # Register scheduled pipeline jobs
-    JobRegistry.register_jobs(scheduler)
-
-    # Register status monitor (every 1 minute)
-    scheduler.add_job(
-        func=StatusMonitorJob.execute,
-        trigger="interval",
-        minutes=1,
-        id="status_monitor",
-        replace_existing=True
-    )
-
+    scheduler = BackgroundScheduler()
     scheduler.start()
 
-    return scheduler
+    while True:
+        is_leader = LeaderElectionService.try_acquire_or_renew()
 
-How this plugs into runtime (important)
+        if is_leader and not scheduler.running:
+            scheduler.start()
+            JobRegistry.register_jobs(scheduler)
+            scheduler.add_job(
+                StatusMonitorJob.execute,
+                trigger="interval",
+                minutes=1,
+                id="status_monitor",
+                replace_existing=True
+            )
 
-You will call start_scheduler() from exactly one place:
+        if not is_leader and scheduler.running:
+            scheduler.shutdown(wait=False)
 
-Either:
+        time.sleep(30)
 
-a standalone main.py for scheduler service
 
-Or:
-
-if __name__ == "__main__":
-
-⚠️ Do NOT start APScheduler inside FastAPI lifecycle hooks.
-That’s how people accidentally start N schedulers per pod.
-
-Current architecture state (checkpoint)
-
-You now have:
-
-Stateless FastAPI execution service
-
-Durable scheduler metadata
-
-APScheduler as a thin trigger engine
-
-Clean separation of concerns
-
-Restart-safe scheduling
-
-This is already better than many Airflow deployments.
+👉 Only one pod will ever schedule jobs.
